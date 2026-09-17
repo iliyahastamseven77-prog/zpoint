@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# zpoint — interactive management menu (TUI-lite)
+# Property of the @ily_bio research channel (@iliyahsatam).
+set -euo pipefail
+
+# resolve the project root from THIS script's own location (works from any
+# unpack path; ZP_ROOT_OVERRIDE wins if the user exports it)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ZP_ROOT="${ZP_ROOT_OVERRIDE:-$SCRIPT_DIR}"
+ZP_CONFIGS="$ZP_ROOT/configs"
+ZP_BIN="$ZP_ROOT/bin"
+mkdir -p "$ZP_CONFIGS"
+export ZP_ROOT
+
+C_G="\033[0;32m"; C_Y="\033[0;33m"; C_R="\033[0;31m"; C_B="\033[0;36m"; C_0="\033[0m"
+title() { echo -e "${C_B}────────────────────────────────────────────${C_0}"; }
+hdr()   { echo -e "${C_G}$*${C_0}"; }
+warn()  { echo -e "${C_Y}$*${C_0}"; }
+err()   { echo -e "${C_R}$*${C_0}"; }
+
+owner_banner() {
+  echo -e "${C_Y}Zpoint research transport — property of @ily_bio / @iliyahsatam${C_0}"
+}
+
+list_configs() {
+  local kind="$1"
+  ls -1 "$ZP_CONFIGS"/*."$kind.zpoint" 2>/dev/null || true
+}
+
+pick_config() {
+  local kind="$1"
+  mapfile -t files < <(list_configs "$kind")
+  if [[ ${#files[@]} -eq 0 ]]; then err "  no $kind configs found"; return 1; fi
+  for i in "${!files[@]}"; do printf "  %d) %s\n" "$((i+1))" "$(basename "${files[$i]}")"; done
+  read -rp "  #? " n
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#files[@]} )) && { echo "${files[$((n-1))]}"; return 0; }
+  return 1
+}
+
+gen_kit() {
+  title; hdr "Create new server/client kit"
+  read -rp "  Transport [1=Firebase RTDB (default), 2=Google Apps Script pool]: " TR
+  local GAS_URLS=() GAS_TOKEN=""
+  local DB="" AUTH=""
+  if [[ "$TR" == "2" ]]; then
+    echo "  GAS pool URLs (script.google.com/.../exec), one per line, empty line to finish:"
+    while true; do
+      read -rp "    url: " U
+      [[ -z "$U" ]] && break
+      [[ "$U" =~ ^https://script\.google\.com/ ]] || { err "    must be https://script.google.com/..."; continue; }
+      GAS_URLS+=("$U")
+    done
+    [[ ${#GAS_URLS[@]} -eq 0 ]] && { err "  no GAS URLs"; return 1; }
+    read -rp "  Shared token (ZP_TOKEN in Script Properties): " GAS_TOKEN
+    [[ -n "$GAS_TOKEN" ]] || { err "  token required"; return 1; }
+  else
+    read -rp "  Firebase RTDB URL (https://…firebasedatabase.app): " DB
+    [[ "$DB" =~ ^https:// ]] || { err "  bad URL"; return 1; }
+    read -rp "  DB secret/auth token (Enter to skip): " AUTH
+  fi
+  read -rp "  Client id [c1]: " CID; CID=${CID:-c1}
+  local OUT
+  OUT=$(python3 - "$DB" "$AUTH" "$CID" "${GAS_TOKEN}" "${GAS_URLS[@]+"${GAS_URLS[@]}"}" <<'PY'
+import os, sys, time
+sys.path.insert(0, os.environ["ZP_ROOT"])
+from core.config import new_kit
+from core.gas import new_gas_config
+from core.crypto import new_key, new_dir_prefix, gen_session_id
+import json
+db, auth, cid, token = sys.argv[1], (sys.argv[2] or ""), sys.argv[3], sys.argv[4]
+urls = [u for u in sys.argv[5:] if u]
+if urls:
+    session = gen_session_id(); key = new_key()
+    up, down = new_dir_prefix(), new_dir_prefix()
+    kit = {"server": new_gas_config("server", urls, token, session, key, up, down),
+           "client": new_gas_config("client", urls, token, session, key, up, down, cid)}
+else:
+    kit = new_kit(db, auth, "research", cid)
+print(json.dumps(kit))
+PY
+) || { err "  keygen failed"; return 1; }
+  local TS; TS=$(date +%Y%m%d-%H%M%S)
+  SRV="$ZP_CONFIGS/server-$TS.server.zpoint"
+  CLI="$ZP_CONFIGS/client-$TS.client.zpoint"
+  python3 - "$SRV" "$CLI" "$OUT" <<'PY'
+import os, sys, json
+sys.path.insert(0, os.environ["ZP_ROOT"])
+from core.config import save
+srv, cli, out = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+save(srv, out["server"]); save(cli, out["client"])
+print("OK")
+PY
+  chmod 600 "$SRV" "$CLI" 2>/dev/null || true
+  hdr "  ✔ server: $(basename "$SRV")"
+  hdr "  ✔ client: $(basename "$CLI")"
+  warn "  → copy the CLIENT file to your local machine (treat as password)"
+}
+
+show_config() {
+  title; hdr "Show config"
+  read -rp "  kind (server/client): " K; K=${K:-client}
+  F=$(pick_config "$K") || return 1
+  python3 -c "
+import json,sys
+c = json.load(open('$F'))
+c['key'] = c.get('key','')[:8]+'…'
+c['auth'] = '***' if c.get('auth') else ''
+print(json.dumps(c, indent=2, ensure_ascii=False))"
+}
+
+delete_config() {
+  title; hdr "Delete config"
+  read -rp "  kind (server/client): " K; K=${K:-client}
+  F=$(pick_config "$K") || return 1
+  read -rp "  really delete $(basename "$F")? y/N " yn
+  [[ "$yn" == "y" ]] && rm -f "$F" && hdr "  ✔ deleted"
+}
+
+bench() {
+  title; hdr "Latency bench (RTDB round-trip from THIS machine)"
+  read -rp "  Firebase RTDB URL: " DB
+  [[ "$DB" =~ ^https:// ]] || { err "  bad URL"; return 1; }
+  read -rp "  auth (Enter to skip): " AUTH
+  python3 - "$DB" "$AUTH" <<'PY'
+import os, sys, time
+sys.path.insert(0, os.environ["ZP_ROOT"])
+from core.rtdb import RTDB
+db = RTDB(sys.argv[1], sys.argv[2] or "")
+path = f"z/bench-{int(time.time())}/p"
+xs = []
+for i in range(5):
+    t0 = time.time()
+    db.put(f"{path}/{i}", {"t": i, "b": "x"*512})
+    v = db.get(f"{path}/{i}")
+    dt = (time.time()-t0)*1000
+    ok = isinstance(v, dict) and v.get("t") == i
+    xs.append(dt)
+    print(f"  #{i+1}: {dt:7.1f} ms  {'OK' if ok else 'BAD'}")
+db.delete(path)
+xs.sort()
+print(f"  min/med/max: {xs[0]:.0f}/{xs[len(xs)//2]:.0f}/{xs[-1]:.0f} ms")
+PY
+}
+
+gas_bench() {
+  title; hdr "Latency bench (Google Apps Script pool, ping per script)"
+  read -rp "  GAS config file (Enter to pick): " F
+  [[ -z "$F" ]] && { F=$(pick_config client) || return 1; }
+  python3 - "$F" <<'PY'
+import os, sys, time
+sys.path.insert(0, os.environ["ZP_ROOT"])
+from core.config import load
+from core.gas import GASCarrier, token_mac
+cfg = load(sys.argv[1])
+urls = cfg.get("gas_urls") or []
+tok = cfg.get("gas_token") or ""
+print(f"  token mac: {token_mac(tok)}  pool: {len(urls)} script(s)")
+for i, u in enumerate(urls):
+    try:
+        c = GASCarrier(u, tok, name=f"gas{i}")
+        ms = c.ping()
+        print(f"  #{i+1}: {ms:7.1f} ms  OK   {u[:60]}…")
+    except Exception as e:
+        print(f"  #{i+1}: FAILED      {type(e).__name__}: {e}")
+PY
+}
+
+bandwidth_status() {
+  title; hdr "Bandwidth / quota status (monthly, free tier 10 GiB)"
+  python3 <<'PY'
+import os, sys, glob, json
+sys.path.insert(0, os.environ["ZP_ROOT"])
+from core.bandwidth import BandwidthMeter
+m = BandwidthMeter("/root/projects/zpoint/configs")
+print("  " + m.human())
+s = m.snapshot()
+bar_len = 30
+filled = int(bar_len * s["used_pct"] / 100.0)
+bar = "█" * filled + "░" * (bar_len - filled)
+print(f"  [{bar}] {s['used_pct']:.1f}%")
+# per-client configs (future: app reads this same file)
+import os
+print("  meter file:", os.path.join("/root/projects/zpoint/configs", "bandwidth.json"))
+PY
+}
+
+services_menu() {
+  while true; do
+    title; hdr "Services"
+    echo "  1) List zpoint services"
+    echo "  2) Start service"
+    echo "  3) Stop service"
+    echo "  4) Restart service"
+    echo "  5) Follow logs"
+    echo "  0) Back"
+    read -rp "  choice: " c
+    case "$c" in
+      1) systemctl list-units 'zpoint-*' --all --no-pager ;;
+      2|3|4)
+         mapfile -t svcs < <(systemctl list-units 'zpoint-*' --all --no-legend | awk '{print $1}')
+         [[ ${#svcs[@]} -eq 0 ]] && { warn "  none"; continue; }
+         for i in "${!svcs[@]}"; do printf "  %d) %s\n" "$((i+1))" "${svcs[$i]}"; done
+         read -rp "  #? " n
+         if [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#svcs[@]} )); then
+           s="${svcs[$((n-1))]}"
+           case "$c" in 2) systemctl start "$s";; 3) systemctl stop "$s";; 4) systemctl restart "$s";; esac
+           hdr "  ✔ $s done"
+         fi ;;
+      5)
+         mapfile -t svcs < <(systemctl list-units 'zpoint-*' --no-legend | awk '{print $1}')
+         [[ ${#svcs[@]} -eq 0 ]] && { warn "  none running"; continue; }
+         for i in "${!svcs[@]}"; do printf "  %d) %s\n" "$((i+1))" "${svcs[$i]}"; done
+         read -rp "  #? " n
+         if [[ "$n" =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#svcs[@]} )); then
+           journalctl -u "${svcs[$((n-1))]}" -f --no-pager
+         fi ;;
+      0) return ;;
+    esac
+  done
+}
+
+create_service() {
+  title; hdr "Install systemd service for a config"
+  read -rp "  role (exit/client): " ROLE; ROLE=${ROLE:-exit}
+  F=$(pick_config "$ROLE") || return 1
+  read -rp "  service name [zpoint-$ROLE]: " NAME; NAME=${NAME:-zpoint-$ROLE}
+  local LISTEN=""
+  [[ "$ROLE" == "client" ]] && { read -rp "  listen [127.0.0.1:1086]: " L; LISTEN="${L:-127.0.0.1:1086}"; }
+  local UNIT="/etc/systemd/system/${NAME}.service"
+  {
+    echo "[Unit]"
+    echo "Description=Zpoint $ROLE ($NAME)"
+    echo "After=network-online.target"; echo "Wants=network-online.target"
+    echo ""
+    echo "[Service]"
+    echo "Type=simple"
+    echo "ExecStart=/usr/bin/env python3 $ZP_BIN/zpointd serve $ROLE $F ${LISTEN:+--listen $LISTEN}"
+    echo "Restart=always"; echo "RestartSec=3"
+    echo "Nice=5"
+    echo ""
+    echo "[Install]"
+    echo "WantedBy=multi-user.target"
+  } > "$UNIT"
+  systemctl daemon-reload
+  systemctl enable --now "$NAME" 2>/dev/null || true
+  hdr "  ✔ service $NAME installed and started"
+}
+
+main_menu() {
+  clear || true
+  while true; do
+    title
+    owner_banner
+    hdr "Zpoint management"
+    title
+    echo "  1) Create new server/client kit"
+    echo "  2) Show config"
+    echo "  3) Delete config"
+    echo "  4) Latency bench (RTDB round-trip)"
+    echo "  4g) Latency bench (GAS pool ping)"
+    echo "  5) Bandwidth / quota status"
+    echo "  6) Services (list/start/stop/restart/logs)"
+    echo "  7) Install systemd service for a config"
+    echo "  8) Run client in foreground (SOCKS5)"
+    echo "  9) Run exit in foreground"
+    echo "  0) Exit"
+    title
+    read -rp "  choice: " c
+    case "$c" in
+      1) gen_kit ;;
+      2) show_config ;;
+      3) delete_config ;;
+      4) bench ;;
+      4g) gas_bench ;;
+      5) bandwidth_status ;;
+      6) services_menu ;;
+      7) create_service ;;
+      8)
+         F=$(pick_config client) || continue
+         read -rp "  listen [127.0.0.1:1086]: " L; L=${L:-127.0.0.1:1086}
+         python3 "$ZP_BIN/zpointd" serve client "$F" --listen "$L" ;;
+      9)
+         F=$(pick_config server) || continue
+         python3 "$ZP_BIN/zpointd" serve exit "$F" ;;
+      0) echo "bye 👋"; exit 0 ;;
+      *) warn "  ?" ;;
+    esac
+  done
+}
+
+main_menu

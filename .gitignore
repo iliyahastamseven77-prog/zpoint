@@ -1,0 +1,35 @@
+# Secrets & generated config kits — NEVER commit
+configs/
+*.zpoint
+*.b64
+bandwidth.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Desktop GUI caches
+desktop/__pycache__/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Distribution artifacts
+zpoint.zip
+zpoint-*.zip
+dist/

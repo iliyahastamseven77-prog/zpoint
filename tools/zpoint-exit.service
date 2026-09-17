@@ -1,0 +1,21 @@
+[Unit]
+Description=Zpoint GAS exit daemon (relay to real TCP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/projects/zpoint/bin/zpointd serve exit /root/projects/zpoint/configs/server-20260831-103423.server.zpoint
+Restart=always
+RestartSec=5
+WorkingDirectory=/root/projects/zpoint
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=true
+ReadWritePaths=/root/projects/zpoint/configs
+
+[Install]
+WantedBy=multi-user.target

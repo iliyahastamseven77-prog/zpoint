@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""zpointd — run client or exit daemon from a .zpoint config.
+
+Usage:
+  zpointd serve exit   <config.zpoint>
+  zpointd serve client <config.zpoint> [--listen 127.0.0.1:1086]
+
+Transport is chosen by the config:  "transport": "gas"  -> Apps Script pool
+(any other/missing value -> Firebase RTDB, the v1 carrier).
+
+Property of the @ily_bio research channel (@iliyahsatam).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import os
+import signal
+import sys
+import time
+
+# resolve the project root from THIS file's own location (works from any
+# unpack path; ZP_ROOT_OVERRIDE wins if the user exports it)
+_ZP_ROOT = os.environ.get("ZP_ROOT_OVERRIDE") or os.path.dirname(
+    os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, _ZP_ROOT)
+
+from core.config import load           # noqa: E402
+from core.crypto import FrameCrypto    # noqa: E402
+
+
+def b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s.encode())
+
+
+def serve_gas(cfg: dict, role: str, listen) -> int:
+    """transport=gas: Apps Script Web App pool carrier."""
+    from core.gas_nodes import node_from_config
+    node = node_from_config(cfg, role, log_fn=lambda s: print(s, flush=True),
+                            listen=listen)
+    if role == "client":
+        from core.bandwidth import BandwidthMeter
+        node.meter = BandwidthMeter("/root/projects/zpoint/configs")
+    node.start()
+    stop = node.stop
+    try:
+        while not stop.is_set():
+            time.sleep(30)
+            if role == "client" and node.meter:
+                print("[zpointd]", node.meter.human(), flush=True)
+    except KeyboardInterrupt:
+        pass
+    node.stop_all()
+    return 0
+
+
+def serve_rtdb(cfg: dict, role: str, listen) -> int:
+    """v1 Firebase RTDB carrier (REST + SSE)."""
+    key = b64d(cfg["key"])
+    up = b64d(cfg["up_prefix"])
+    down = b64d(cfg["down_prefix"])
+    if role == "exit":
+        from core.exit import ExitNode
+        node = ExitNode(cfg["db_url"], cfg.get("auth", ""), cfg["session"],
+                        key, up, down)
+        node.start()
+        stop = node.stop
+        try:
+            while not stop.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        node.stop_all()
+    else:
+        from core.client import ClientNode
+        node = ClientNode(cfg["db_url"], cfg.get("auth", ""), cfg["session"],
+                          key, up, down,
+                          listen=(listen[0], listen[1]),
+                          client_id=cfg.get("client_id", "c1"),
+                          state_dir="/root/projects/zpoint/configs")
+        node.start()
+        stop = node.stop
+        print("[zpointd] bandwidth:", node.meter.human(), flush=True)
+        try:
+            while not stop.is_set():
+                time.sleep(30)
+                print("[zpointd]", node.meter.human(), flush=True)
+        except KeyboardInterrupt:
+            pass
+        node.stop_all()
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="zpointd")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    serve = sub.add_parser("serve")
+    serve.add_argument("role", choices=["exit", "client"])
+    serve.add_argument("config")
+    serve.add_argument("--listen", default="127.0.0.1:1086")
+    args = ap.parse_args()
+
+    cfg = load(args.config)
+    listen = args.listen.split(":")
+    listen_t = (listen[0], int(listen[1]))
+
+    stop_holder = {}
+
+    def _sig(_a, _b):
+        print("\n[zpointd] shutting down…", flush=True)
+        node = stop_holder.get("node")
+        if node is not None:
+            node.stop.set()
+
+    signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
+
+    if cfg.get("transport") == "gas":
+        return serve_gas(cfg, args.role, listen_t)
+    return serve_rtdb(cfg, args.role, listen_t)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
